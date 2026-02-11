@@ -11,13 +11,13 @@ WS_URL = "https://fawss.pi42.com/"
 
 # 🔥 SYMBOL CONFIG
 SYMBOL_CONFIG = {
-    "HOODINR": {"qty": 0.70},
-    "MSTRINR": {"qty": 0.40},
-    "INTCINR": {"qty": 1.20},
-    "AMZNINR": {"qty": 0.30},
-    "CRCLINR": {"qty": 1.00},
+    "HOODINR": {"qty": 0.75},
+    "MSTRINR": {"qty": 0.45},
+    "INTCINR": {"qty": 1.25},
+    "AMZNINR": {"qty": 0.35},
+    "CRCLINR": {"qty": 1.15},
     "COININR": {"qty": 0.35},
-    "PLTRINR": {"qty": 0.40},
+    "PLTRINR": {"qty": 0.45},
 }
 
 SYMBOLS = list(SYMBOL_CONFIG.keys())
@@ -92,6 +92,8 @@ def place_market_buy(sym):
     
     # Generate the current timestamp in milliseconds as STRING
     timestamp = str(int(time.time() * 1000))
+    target= calculate_target(prices[sym])  # Add take profit
+    
 
     # Define the order parameters - EXACT match to reference
     params = {
@@ -105,8 +107,8 @@ def place_market_buy(sym):
         'reduceOnly': False,
         'marginAsset': 'INR',
         'deviceType': 'WEB',
-        'userCategory': 'EXTERNAL',  # 🔥 ADD THIS - MISSING IN YOUR CODE
-        'takeProfitPrice': calculate_target(prices[sym])  # Add take profit
+        'userCategory': 'EXTERNAL', # 🔥 ADD THIS - MISSING IN YOUR CODE
+        'takeProfitPrice': target
     }
 
     # Convert the parameters to a JSON string to sign - EXACT separators
