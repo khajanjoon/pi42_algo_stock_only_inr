@@ -2,4 +2,4 @@ asyncio
 aiohttp
 requests
 python-dotenv
-socketio
+python-socketio
