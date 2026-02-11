@@ -1,4 +1,4 @@
-import socketio, requests, time, os, hashlib, hmac, threading, json
+import socketio, requests, time, os, hashlib, hmac, threading, json , math
 from dotenv import load_dotenv
 
 # ========= CONFIG =========
@@ -9,18 +9,21 @@ API_SECRET = os.getenv("SECRET_KEY")
 BASE_URL = "https://fapi.pi42.com"
 WS_URL = "https://fawss.pi42.com/"
 
-# 🔥 SYMBOL CONFIG
-SYMBOL_CONFIG = {
-    "HOODINR": {"qty": 0.75},
-    "MSTRINR": {"qty": 0.45},
-    "INTCINR": {"qty": 1.25},
-    "AMZNINR": {"qty": 0.35},
-    "CRCLINR": {"qty": 1.15},
-    "COININR": {"qty": 0.35},
-    "PLTRINR": {"qty": 0.45},
-}
+SYMBOLS = ["HOODINR","MSTRINR","INTCINR","AMZNINR","CRCLINR","COININR","PLTRINR"]
 
-SYMBOLS = list(SYMBOL_CONFIG.keys())
+# ₹ capital per trade
+CAPITAL_PER_TRADE = 6000  
+
+# Exchange minimum lot sizes
+MIN_QTY = {
+    "HOODINR": 0.08,
+    "MSTRINR": 0.05,
+    "INTCINR": 0.13,
+    "AMZNINR": 0.03,
+    "CRCLINR": 0.10,
+    "COININR": 0.04,
+    "PLTRINR": 0.05,
+}
 
 DROP_PERCENT = 5
 TP_PERCENT = 2.5
@@ -28,27 +31,36 @@ TRADE_COOLDOWN = 20
 
 sio = socketio.Client(reconnection=True)
 
-prices = {}
-positions = {}
-orders = {}
+prices, positions, orders = {}, {}, {}
 last_trade = {s:0 for s in SYMBOLS}
 
-# ========= SIGNATURE FUNCTION - EXACT MATCH TO REFERENCE =========
-def generate_signature(api_secret, data_to_sign):
-    """EXACT signature function from Pi42 reference."""
-    return hmac.new(
-        api_secret.encode('utf-8'), 
-        data_to_sign.encode('utf-8'), 
-        hashlib.sha256
-    ).hexdigest()
+# ========= SIGNATURE =========
+def generate_signature(secret, message):
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 def sign(query):
-    """Signature for GET requests."""
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-# ========= TARGET CALC =========
+# ========= TARGET =========
 def calculate_target(entry):
     return int(round(entry * (1 + TP_PERCENT/100)))
+
+# ========= DYNAMIC QTY =========
+def calculate_order_qty(sym):
+    price = prices.get(sym)
+    if not price:
+        return None
+
+    raw_qty = CAPITAL_PER_TRADE / price
+    min_qty = MIN_QTY.get(sym, 0.01)
+
+    steps = int(raw_qty / min_qty)
+    qty = round(steps * min_qty, 8)
+    
+
+    if qty < min_qty:
+        return None
+    return f"{qty:.2f}"
 
 # ========= FETCH POSITIONS =========
 def fetch_positions_loop():
@@ -65,7 +77,7 @@ def fetch_positions_loop():
             print("Position error:", e)
         time.sleep(10)
 
-# ========= FETCH OPEN ORDERS =========
+# ========= FETCH ORDERS =========
 def fetch_orders_loop():
     while True:
         try:
@@ -86,75 +98,40 @@ def get_lowest_sell(sym):
                    if o["side"]=="SELL" and o.get("price")]
     return min(sell_prices) if sell_prices else None
 
-# ========= BUY ORDER - EXACT MATCH TO REFERENCE =========
+# ========= PLACE ORDER =========
 def place_market_buy(sym):
-    """Place market buy order - EXACT match to Pi42 reference."""
-    
-    # Generate the current timestamp in milliseconds as STRING
-    timestamp = str(int(time.time() * 1000))
-    target= calculate_target(prices[sym])  # Add take profit
-    
+    qty = calculate_order_qty(sym)
+    if not qty:
+        print(f"Qty too small for {sym}")
+        return False
 
-    # Define the order parameters - EXACT match to reference
+    timestamp = str(int(time.time()*1000))
+    target = calculate_target(prices[sym])
+
     params = {
-        'timestamp': timestamp,
-        'placeType': 'ORDER_FORM',
-        'quantity': SYMBOL_CONFIG[sym]["qty"],  # Keep as is, don't format
-        'side': 'BUY',
-        'price': 0,
-        'symbol': sym,
-        'type': 'MARKET',  # CRITICAL: 'type' not 'orderType'
-        'reduceOnly': False,
-        'marginAsset': 'INR',
-        'deviceType': 'WEB',
-        'userCategory': 'EXTERNAL', # 🔥 ADD THIS - MISSING IN YOUR CODE
-        'takeProfitPrice': target
+        "timestamp": timestamp,
+        "placeType": "ORDER_FORM",
+        "quantity": f"{qty:.2f}",
+        "side": "BUY",
+        "price": 0,
+        "symbol": sym,
+        "type": "MARKET",
+        "reduceOnly": False,
+        "marginAsset": "INR",
+        "deviceType": "WEB",
+        "userCategory": "EXTERNAL",
+        "takeProfitPrice": target
     }
 
-    # Convert the parameters to a JSON string to sign - EXACT separators
-    data_to_sign = json.dumps(params, separators=(',', ':'))
+    body = json.dumps(params, separators=(',', ':'))
+    signature = generate_signature(API_SECRET, body)
 
-    # Generate the signature for authentication
-    signature = generate_signature(API_SECRET, data_to_sign)
+    headers = {"api-key":API_KEY,"signature":signature,"Content-Type":"application/json"}
 
-    # Define the headers including the API key and the signature
-    headers = {
-        'api-key': API_KEY,
-        'signature': signature,
-        'Content-Type': 'application/json'  # Add content type
-    }
-
-    print(f"\n🚀 ORDER SENT for {sym}")
-    print(f"Body: {data_to_sign}")
-    print(f"Signature: {signature}")
-    print(f"API Key: {API_KEY[:10]}...{API_KEY[-5:] if API_KEY else 'None'}")
-
-    try:
-        # Send the POST request to place the order - EXACT match
-        response = requests.post(
-            f'{BASE_URL}/v1/order/place-order', 
-            json=params,  # Use json parameter
-            headers=headers,
-            timeout=15
-        )
-
-        # Raise an HTTPError if the response status is 4xx or 5xx
-        response.raise_for_status()
-
-        # Parse the JSON response data
-        response_data = response.json()
-
-        # Print the success message with the order details
-        print('✅ Order placed successfully:', json.dumps(response_data, indent=4))
-        last_trade[sym] = time.time()
-        return True
-
-    except requests.exceptions.HTTPError as err:
-        print(f"❌ HTTP Error: {err.response.text if err.response else err}")
-        return False
-    except Exception as e:
-        print(f"❌ An unexpected error occurred: {str(e)}")
-        return False
+    r = requests.post(f"{BASE_URL}/v1/order/place-order", data=body, headers=headers, timeout=15)
+    print(f"\n🚀 ORDER {sym} Qty:{qty} TP:{target}")
+    print("Response:", r.text)
+    return True
 
 # ========= TRADE LOGIC =========
 def trade_logic(sym):
@@ -162,19 +139,20 @@ def trade_logic(sym):
         return
     if time.time() - last_trade[sym] < TRADE_COOLDOWN:
         return
-
     lowest = get_lowest_sell(sym)
+  
     if not lowest:
         return
-
+ 
     trigger = lowest * (1 - DROP_PERCENT/100)
+    
 
     if prices[sym] <= trigger:
-        print(f"📉 {sym} BUY trigger!")
-        place_market_buy(sym)
-        last_trade[sym] = time.time()
+        print(f"📉 {sym} BUY trigger")
+        if place_market_buy(sym):
+            last_trade[sym] = time.time()
 
-# ========= DISPLAY =========
+# ========= DASHBOARD =========
 def display_loop():
     while True:
         print("\n========== DASHBOARD ==========")
@@ -195,8 +173,7 @@ def display_loop():
 @sio.event
 def connect():
     print("WS Connected")
-    subs = [f"{s.lower()}@markPrice" for s in SYMBOLS]
-    sio.emit('subscribe', {'params': subs})
+    sio.emit('subscribe', {'params':[f"{s.lower()}@markPrice" for s in SYMBOLS]})
 
 @sio.on('markPriceUpdate')
 def on_price(data):
@@ -210,5 +187,11 @@ if __name__ == "__main__":
     threading.Thread(target=fetch_positions_loop, daemon=True).start()
     threading.Thread(target=fetch_orders_loop, daemon=True).start()
     threading.Thread(target=display_loop, daemon=True).start()
-    sio.connect(WS_URL)
-    sio.wait()
+
+    while True:
+        try:
+            sio.connect(WS_URL)
+            sio.wait()
+        except Exception as e:
+            print("WS reconnecting...", e)
+            time.sleep(5)
