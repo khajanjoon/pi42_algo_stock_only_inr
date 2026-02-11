@@ -1,4 +1,4 @@
-import socketio, requests, time, os, hashlib, hmac, threading, json , math
+import socketio, requests, time, os, hashlib, hmac, threading, json
 from dotenv import load_dotenv
 
 # ========= CONFIG =========
@@ -11,10 +11,11 @@ WS_URL = "https://fawss.pi42.com/"
 
 SYMBOLS = ["HOODINR","MSTRINR","INTCINR","AMZNINR","CRCLINR","COININR","PLTRINR"]
 
-# ₹ capital per trade
-CAPITAL_PER_TRADE = 6000  
+CAPITAL_PER_TRADE = 6000
+DROP_PERCENT = 5
+TP_PERCENT = 2.5
+TRADE_COOLDOWN = 20
 
-# Exchange minimum lot sizes
 MIN_QTY = {
     "HOODINR": 0.08,
     "MSTRINR": 0.05,
@@ -25,16 +26,12 @@ MIN_QTY = {
     "PLTRINR": 0.05,
 }
 
-DROP_PERCENT = 5
-TP_PERCENT = 2.5
-TRADE_COOLDOWN = 20
-
 sio = socketio.Client(reconnection=True)
 
 prices, positions, orders = {}, {}, {}
-last_trade = {s:0 for s in SYMBOLS}
+last_trade = {s: 0 for s in SYMBOLS}
 
-# ========= SIGNATURE =========
+# ========= SIGN =========
 def generate_signature(secret, message):
     return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
@@ -50,17 +47,73 @@ def calculate_order_qty(sym):
     price = prices.get(sym)
     if not price:
         return None
-
     raw_qty = CAPITAL_PER_TRADE / price
-    min_qty = MIN_QTY.get(sym, 0.01)
+    step = MIN_QTY.get(sym, 0.01)
+    qty = int(raw_qty / step) * step
+    return round(qty, 2)
 
-    steps = int(raw_qty / min_qty)
-    qty = round(steps * min_qty, 8)
-    
+# ========= LOWEST SELL =========
+def get_lowest_sell(sym):
+    sells = [float(o["price"]) for o in orders.get(sym,[])
+             if o["side"]=="SELL" and o.get("price")]
+    return min(sells) if sells else None
 
-    if qty < min_qty:
+# ========= TRIGGER =========
+def get_trigger_price(sym):
+    lowest = get_lowest_sell(sym)
+    if not lowest:
         return None
-    return f"{qty:.2f}"
+    return round(lowest * (1 - DROP_PERCENT/100), 2)
+
+# ========= PLACE ORDER =========
+def place_market_buy(sym):
+    qty = calculate_order_qty(sym)
+    if not qty:
+        return False
+
+    timestamp = str(int(time.time()*1000))
+    tp = calculate_target(prices[sym])
+
+    params = {
+        "timestamp": timestamp,
+        "placeType": "ORDER_FORM",
+        "quantity": qty,
+        "side": "BUY",
+        "price": 0,
+        "symbol": sym,
+        "type": "MARKET",
+        "reduceOnly": False,
+        "marginAsset": "INR",
+        "deviceType": "WEB",
+        "userCategory": "EXTERNAL",
+        "takeProfitPrice": tp
+    }
+
+    body = json.dumps(params, separators=(',', ':'))
+    signature = generate_signature(API_SECRET, body)
+
+    headers = {"api-key":API_KEY,"signature":signature,"Content-Type":"application/json"}
+
+    r = requests.post(f"{BASE_URL}/v1/order/place-order", data=body, headers=headers, timeout=15)
+    print(f"\n🚀 BUY {sym} Qty:{qty} TP:{tp}")
+    print("Response:", r.text)
+    return True
+
+# ========= TRADE LOGIC =========
+def trade_logic(sym):
+    if sym not in prices:
+        return
+    if time.time() - last_trade[sym] < TRADE_COOLDOWN:
+        return
+
+    trigger = get_trigger_price(sym)
+    if not trigger:
+        return
+
+    if prices[sym] <= trigger:
+        print(f"📉 {sym} BUY @ {prices[sym]} | Trigger {trigger}")
+        if place_market_buy(sym):
+            last_trade[sym] = time.time()
 
 # ========= FETCH POSITIONS =========
 def fetch_positions_loop():
@@ -92,66 +145,6 @@ def fetch_orders_loop():
             print("Order error:", e)
         time.sleep(12)
 
-# ========= LOWEST SELL =========
-def get_lowest_sell(sym):
-    sell_prices = [float(o["price"]) for o in orders.get(sym,[])
-                   if o["side"]=="SELL" and o.get("price")]
-    return min(sell_prices) if sell_prices else None
-
-# ========= PLACE ORDER =========
-def place_market_buy(sym):
-    qty = calculate_order_qty(sym)
-    if not qty:
-        print(f"Qty too small for {sym}")
-        return False
-
-    timestamp = str(int(time.time()*1000))
-    target = calculate_target(prices[sym])
-
-    params = {
-        "timestamp": timestamp,
-        "placeType": "ORDER_FORM",
-        "quantity": f"{qty:.2f}",
-        "side": "BUY",
-        "price": 0,
-        "symbol": sym,
-        "type": "MARKET",
-        "reduceOnly": False,
-        "marginAsset": "INR",
-        "deviceType": "WEB",
-        "userCategory": "EXTERNAL",
-        "takeProfitPrice": target
-    }
-
-    body = json.dumps(params, separators=(',', ':'))
-    signature = generate_signature(API_SECRET, body)
-
-    headers = {"api-key":API_KEY,"signature":signature,"Content-Type":"application/json"}
-
-    r = requests.post(f"{BASE_URL}/v1/order/place-order", data=body, headers=headers, timeout=15)
-    print(f"\n🚀 ORDER {sym} Qty:{qty} TP:{target}")
-    print("Response:", r.text)
-    return True
-
-# ========= TRADE LOGIC =========
-def trade_logic(sym):
-    if sym not in prices:
-        return
-    if time.time() - last_trade[sym] < TRADE_COOLDOWN:
-        return
-    lowest = get_lowest_sell(sym)
-  
-    if not lowest:
-        return
- 
-    trigger = lowest * (1 - DROP_PERCENT/100)
-    
-
-    if prices[sym] <= trigger:
-        print(f"📉 {sym} BUY trigger")
-        if place_market_buy(sym):
-            last_trade[sym] = time.time()
-
 # ========= DASHBOARD =========
 def display_loop():
     while True:
@@ -159,14 +152,23 @@ def display_loop():
         for sym in SYMBOLS:
             price = prices.get(sym)
             pos = positions.get(sym)
-            print(f"{sym} LTP:{price}")
+            lowest = get_lowest_sell(sym)
+            trigger = get_trigger_price(sym)
+            qty = calculate_order_qty(sym)
+
+            print(f"\n🔹 {sym}")
+            print(f"LTP: {price}")
+            print(f"Lowest Sell: {lowest}")
+            print(f"Trigger Price: {trigger}")
+            print(f"Next Qty: {qty}")
+
             if pos:
-                qty = float(pos["quantity"])
                 entry = float(pos["entryPrice"])
-                pnl = (price-entry)*qty if price else 0
-                print(f"  Pos:{qty} Entry:{entry} PnL:{round(pnl,2)}")
+                q = float(pos["quantity"])
+                pnl = (price-entry)*q if price else 0
+                print(f"Position → Qty:{q} Entry:{entry} PnL:{round(pnl,2)}")
             else:
-                print("  No position")
+                print("Position → None")
         time.sleep(4)
 
 # ========= WEBSOCKET =========
