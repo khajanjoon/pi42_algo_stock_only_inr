@@ -1,0 +1,1 @@
+# pi42_algo_stock_only
