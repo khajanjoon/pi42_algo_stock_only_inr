@@ -24,7 +24,11 @@ if not API_KEY or not API_SECRET:
 BASE_URL = "https://fapi.pi42.com"
 WS_URL = "https://fawss.pi42.com/"
 
-SYMBOLS = ["HOODINR","MSTRINR","INTCINR","AMZNINR","CRCLINR","COININR","PLTRINR","TSLAINR"]
+SYMBOLS = [
+    "HOODINR","MSTRINR","INTCINR",
+    "AMZNINR","CRCLINR","COININR",
+    "PLTRINR","TSLAINR"
+]
 
 CAPITAL_PER_TRADE = 10000
 RISE_PERCENT = 3
@@ -43,6 +47,7 @@ MIN_QTY = {
 }
 
 # ========= GLOBAL STATE =========
+
 sio = socketio.Client(reconnection=True)
 
 prices = {}
@@ -51,7 +56,16 @@ orders = {}
 
 last_trade = {s: 0 for s in SYMBOLS}
 
+# sync flags
+positions_loaded = False
+orders_loaded = False
+
+# thread lock
+lock = threading.Lock()
+
+
 # ========= SIGNATURE =========
+
 def generate_signature(secret, message):
 
     return hmac.new(
@@ -69,7 +83,9 @@ def sign(query):
         hashlib.sha256
     ).hexdigest()
 
-# ========= PRICE NORMALIZER =========
+
+# ========= NORMALIZE =========
+
 def normalize_price(sym, price):
 
     if sym.endswith("INR"):
@@ -77,14 +93,18 @@ def normalize_price(sym, price):
 
     return round(price, 2)
 
+
 # ========= TARGET =========
+
 def calculate_target(sym, entry):
 
     tp = entry * (1 + TP_PERCENT / 100)
 
     return normalize_price(sym, tp)
 
+
 # ========= QTY =========
+
 def calculate_order_qty(sym):
 
     price = prices.get(sym)
@@ -100,7 +120,32 @@ def calculate_order_qty(sym):
 
     return round(qty, 6)
 
-# ========= TRIGGER BASED ON TP SELL =========
+
+# ========= ORDER HELPERS =========
+
+def has_position(sym):
+
+    pos = positions.get(sym)
+
+    if not pos:
+        return False
+
+    qty = float(pos.get("quantity", 0))
+
+    return qty > 0
+
+
+def has_open_tp_sell(sym):
+
+    if sym not in orders:
+        return False
+
+    return any(
+        o.get("side") == "SELL"
+        for o in orders[sym]
+    )
+
+
 def get_lowest_tp_sell(sym):
 
     if sym not in orders:
@@ -129,71 +174,84 @@ def get_trigger_price(sym):
 
     return normalize_price(sym, trigger)
 
+
 # ========= PLACE BUY =========
+
 def place_market_buy(sym):
 
-    if sym not in prices:
-        return False
+    with lock:
 
-    qty = calculate_order_qty(sym)
+        price = prices.get(sym)
 
-    if not qty:
-        return False
+        if not price:
+            return False
 
-    entry = normalize_price(sym, prices[sym])
+        qty = calculate_order_qty(sym)
 
-    tp = calculate_target(sym, entry)
+        if not qty:
+            return False
 
-    params = {
+        entry = normalize_price(sym, price)
 
-        "timestamp": str(int(time.time() * 1000)),
-        "placeType": "ORDER_FORM",
-        "quantity": qty,
-        "side": "BUY",
-        "price": 0,
-        "symbol": sym,
-        "type": "MARKET",
-        "reduceOnly": False,
-        "marginAsset": "INR",
-        "deviceType": "WEB",
-        "userCategory": "EXTERNAL",
-        "takeProfitPrice": tp
-    }
+        tp = calculate_target(sym, entry)
 
-    body = json.dumps(params, separators=(',', ':'))
+        params = {
 
-    signature = generate_signature(API_SECRET, body)
+            "timestamp": str(int(time.time() * 1000)),
+            "placeType": "ORDER_FORM",
+            "quantity": qty,
+            "side": "BUY",
+            "price": 0,
+            "symbol": sym,
+            "type": "MARKET",
+            "reduceOnly": False,
+            "marginAsset": "INR",
+            "deviceType": "WEB",
+            "userCategory": "EXTERNAL",
+            "takeProfitPrice": tp
+        }
 
-    headers = {
-        "api-key": API_KEY,
-        "signature": signature,
-        "Content-Type": "application/json"
-    }
+        body = json.dumps(params, separators=(',', ':'))
 
-    try:
+        signature = generate_signature(API_SECRET, body)
 
-        r = requests.post(
-            f"{BASE_URL}/v1/order/place-order",
-            data=body,
-            headers=headers
-        )
+        headers = {
+            "api-key": API_KEY,
+            "signature": signature,
+            "Content-Type": "application/json"
+        }
 
-        print(f"\n🟢 BUY {sym}")
-        print(f"Qty: {qty}")
-        print(f"Entry: {entry}")
-        print(f"TP SELL: {tp}")
-        print("Response:", r.text)
+        try:
 
-        return True
+            r = requests.post(
+                f"{BASE_URL}/v1/order/place-order",
+                data=body,
+                headers=headers
+            )
 
-    except Exception as e:
+            print(f"\n🟢 BUY {sym}")
+            print(f"Qty: {qty}")
+            print(f"Entry: {entry}")
+            print(f"TP SELL: {tp}")
+            print("Response:", r.text)
 
-        print("❌ Order error:", e)
+            last_trade[sym] = time.time()
 
-        return False
+            return True
+
+        except Exception as e:
+
+            print("❌ Order error:", e)
+
+            return False
+
 
 # ========= TRADE LOGIC =========
+
 def trade_logic(sym):
+
+    if not positions_loaded or not orders_loaded:
+        return
 
     if sym not in prices:
         return
@@ -201,37 +259,40 @@ def trade_logic(sym):
     if time.time() - last_trade[sym] < TRADE_COOLDOWN:
         return
 
-    pos = positions.get(sym)
+    price = prices[sym]
 
-    if not pos:
+    # FIRST BUY
+    if not has_position(sym) and not has_open_tp_sell(sym):
 
         print(f"⚡ FIRST BUY {sym}")
 
-        if place_market_buy(sym):
-            last_trade[sym] = time.time()
+        place_market_buy(sym)
 
         return
 
+    # GRID BUY
     trigger = get_trigger_price(sym)
 
-    if trigger is None:
-        return
+    if trigger and price <= trigger:
 
-    if prices[sym] <= trigger:
+        print(f"📉 Trigger BUY {sym} at {price}")
 
-        print(f"📉 Trigger BUY {sym} at {prices[sym]}")
+        place_market_buy(sym)
 
-        if place_market_buy(sym):
-            last_trade[sym] = time.time()
 
 # ========= FETCH POSITIONS =========
+
 def fetch_positions_loop():
+
+    global positions_loaded
 
     while True:
 
         try:
 
             ts = str(int(time.time() * 1000))
+
+            loaded = 0
 
             for sym in SYMBOLS:
 
@@ -256,14 +317,27 @@ def fetch_positions_loop():
                         None
                     )
 
+                    loaded += 1
+
+            if loaded == len(SYMBOLS):
+
+                if not positions_loaded:
+                    print("✅ Positions synced")
+
+                positions_loaded = True
+
         except Exception as e:
 
             print("Position error:", e)
 
-        time.sleep(10)
+        time.sleep(5)
 
-# ========= FETCH OPEN ORDERS =========
+
+# ========= FETCH ORDERS =========
+
 def fetch_orders_loop():
+
+    global orders_loaded
 
     while True:
 
@@ -294,13 +368,20 @@ def fetch_orders_loop():
                         if o["symbol"] == sym
                     ]
 
+                if not orders_loaded:
+                    print("✅ Orders synced")
+
+                orders_loaded = True
+
         except Exception as e:
 
             print("Orders error:", e)
 
-        time.sleep(10)
+        time.sleep(5)
 
-# ========= DASHBOARD =========
+
+# ========= DISPLAY =========
+
 def display_loop():
 
     while True:
@@ -317,17 +398,17 @@ def display_loop():
 
             print(f"\n{sym}")
             print(f"LTP: {price}")
-            print(f"Next BUY Trigger: {trigger}")
+            print(f"Trigger: {trigger}")
             print(f"Next Qty: {qty}")
 
             pos = positions.get(sym)
 
-            if pos:
+            if pos and price:
 
                 entry = float(pos["entryPrice"])
                 q = float(pos["quantity"])
 
-                pnl = (price - entry) * q if price else 0
+                pnl = (price - entry) * q
 
                 print(f"Entry: {entry}")
                 print(f"Qty: {q}")
@@ -335,7 +416,9 @@ def display_loop():
 
         time.sleep(5)
 
+
 # ========= WEBSOCKET =========
+
 @sio.event
 def connect():
 
@@ -343,15 +426,14 @@ def connect():
 
     sio.emit(
         "subscribe",
-        {"params": [f"{s.lower()}@markPrice" for s in SYMBOLS]}
+        {"params":[f"{s.lower()}@markPrice" for s in SYMBOLS]}
     )
 
 
 @sio.on("markPriceUpdate")
 def on_price(data):
 
-    sym = data.get("s", "").upper()
-
+    sym = data.get("s","").upper()
     price = data.get("p")
 
     if sym and price:
@@ -360,23 +442,31 @@ def on_price(data):
 
         trade_logic(sym)
 
+
 # ========= MAIN =========
+
 if __name__ == "__main__":
+
+    print("Starting Production Grid Bot...")
 
     threading.Thread(target=fetch_positions_loop, daemon=True).start()
     threading.Thread(target=fetch_orders_loop, daemon=True).start()
     threading.Thread(target=display_loop, daemon=True).start()
 
+    time.sleep(3)
+
     while True:
+
         try:
-            print("Connecting to WebSocket...")
+
+            print("Connecting WS...")
+
             sio.connect(WS_URL, transports=["websocket"])
-            
-            while sio.connected:
-                time.sleep(1)
+
+            sio.wait()
 
         except Exception as e:
-            print("WS Error:", e)
 
-        print("Reconnecting in 5 sec...")
+            print("WS error:", e)
+
         time.sleep(5)
